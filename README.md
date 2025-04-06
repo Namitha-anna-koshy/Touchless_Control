@@ -31,14 +31,15 @@ Run the app:
 streamlit run frontend.py
 
 Team
+
 Aldrin
 Aneena
 Rithika
 Me
 
 Disclaimer
+
 Touchless Control does not make you a Jedi, but it’s a good start.
 Use responsibly. Do not attempt to scroll using both hands while dancing.
 Made with ❤️, caffeine, and a lot of waving at the camera.
 
-streamlit run frontend.py
