@@ -10,15 +10,114 @@ from win32con import MOUSEEVENTF_WHEEL
 import math
 import pyperclip
 
+class KalmanFilter:
+    def __init__(self, process_noise=0.001, measurement_noise=0.1, error_cov=0.1):
+        self.process_noise = process_noise        # Process noise
+        self.measurement_noise = measurement_noise  # Measurement noise
+        self.error_cov = error_cov                # Estimation error covariance
+        self.state = np.zeros(4)                  # [x, y, vx, vy]
+        self.P = np.eye(4) * self.error_cov       # Estimation error covariance matrix
+        self.F = np.array([                       # State transition matrix
+            [1, 0, 1, 0],
+            [0, 1, 0, 1],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1]
+        ])
+        self.H = np.array([                       # Measurement matrix
+            [1, 0, 0, 0],
+            [0, 1, 0, 0]
+        ])
+        self.Q = np.eye(4) * self.process_noise   # Process noise covariance
+        self.R = np.eye(2) * self.measurement_noise  # Measurement noise covariance
+        self.initialized = False
+        
+    def predict(self):
+        # State prediction
+        self.state = self.F @ self.state
+        # Error covariance prediction
+        self.P = self.F @ self.P @ self.F.T + self.Q
+        return self.state[:2]  # Return x, y
+        
+    def update(self, measurement):
+        if not self.initialized:
+            self.state[:2] = measurement
+            self.initialized = True
+            return self.state[:2]
+            
+        # Measurement update
+        y = measurement - self.H @ self.state
+        S = self.H @ self.P @ self.H.T + self.R
+        K = self.P @ self.H.T @ np.linalg.inv(S)  # Kalman gain
+        self.state = self.state + K @ y
+        self.P = (np.eye(4) - K @ self.H) @ self.P
+        return self.state[:2]  # Return x, y
+        
+    def filter(self, x, y):
+        # Predict state
+        self.predict()
+        # Update with new measurement
+        filtered_pos = self.update(np.array([x, y]))
+        return int(filtered_pos[0]), int(filtered_pos[1])
+
+class StrokeManager:
+    def __init__(self, max_strokes=20, max_points_per_stroke=100):
+        self.strokes = []
+        self.current_stroke = []
+        self.max_strokes = max_strokes
+        self.max_points_per_stroke = max_points_per_stroke
+        self.is_drawing = False
+        
+    def start_stroke(self, point):
+        if self.is_drawing:
+            return
+            
+        self.is_drawing = True
+        self.current_stroke = [point]
+        
+    def add_point(self, point):
+        if not self.is_drawing:
+            return
+            
+        if len(self.current_stroke) < self.max_points_per_stroke:
+            self.current_stroke.append(point)
+        
+    def end_stroke(self):
+        if not self.is_drawing:
+            return
+            
+        if len(self.current_stroke) > 1:  # Only add strokes with at least 2 points
+            self.strokes.append(self.current_stroke[:])
+            if len(self.strokes) > self.max_strokes:
+                self.strokes.pop(0)  # Remove oldest stroke if limit reached
+                
+        self.current_stroke = []
+        self.is_drawing = False
+        
+    def get_current_stroke(self):
+        return self.current_stroke
+        
+    def get_all_strokes(self):
+        return self.strokes
+        
+    def clear_strokes(self):
+        self.strokes = []
+        self.current_stroke = []
+        self.is_drawing = False
+
 class GestureController:
     def __init__(self):
         self.mp_hands = mp.solutions.hands
         self.mp_drawing = mp.solutions.drawing_utils
+        self.mp_face = mp.solutions.face_detection  # Add face detection
+        
         self.hands = self.mp_hands.Hands(
             min_detection_confidence=0.7,
             min_tracking_confidence=0.7,
             max_num_hands=1
         )
+        
+        # Initialize face detection
+        self.face_detection = self.mp_face.FaceDetection(min_detection_confidence=0.7)
 
         # Screen and window setup
         self.whiteboard_width = 1280
@@ -28,18 +127,14 @@ class GestureController:
         pyautogui.FAILSAFE = False
         
         # Mouse control settings
-        self.mouse_smoothing_factor = 0.5
-        self.mouse_speed = 1.5
         self.last_mouse_pos = (0, 0)
+        self.last_actual_pos = (0, 0)
 
         # Drawing setup
         self.whiteboard = np.ones((self.whiteboard_height, self.whiteboard_width, 3), np.uint8) * 255
         self.drawing = False
         self.draw_color = (0, 0, 0)
         self.draw_thickness = 2
-        
-        self.drawing_points = deque(maxlen=100)
-        self.smoothing_factor = 0.15
         
         self.erasing = False
         self.eraser_size = 30
@@ -60,11 +155,15 @@ class GestureController:
         self.last_click_time = 0
         self.click_cooldown = 0.3
 
-        # Updated gesture states
+        # Gesture states and toggles
         self.whiteboard_active = True
+        self.mouse_control_active = True  # Virtual mouse toggle
         self.last_gesture_time = time.time()
         self.gesture_cooldown = 1.0
-        self.toggle_gesture_start = None
+        
+        # Toggle gesture state tracking
+        self.toggle_wb_gesture_start = None
+        self.toggle_mouse_gesture_start = None
         self.toggle_hold_duration = 1.0  # Duration to hold toggle gesture in seconds
         self.last_gesture = None
         
@@ -77,6 +176,33 @@ class GestureController:
         self.last_scroll_y = None
         self.scroll_threshold = 0.02
         self.scroll_gesture_start_y = None
+        
+        # Virtual monitor settings - always active and bigger
+        self.virtual_monitor_active = True  # Always enabled by default
+        self.virtual_monitor_width = 600
+        self.virtual_monitor_height = 450
+        self.virtual_monitor_x = 120
+        self.virtual_monitor_y = 90
+        self.in_virtual_monitor = False
+        
+        # Initialize Kalman filter for cursor position
+        self.position_kalman = KalmanFilter(process_noise=0.001, measurement_noise=0.1)
+        
+        # Initialize Kalman filter for drawing
+        self.drawing_kalman = KalmanFilter(process_noise=0.0005, measurement_noise=0.05)
+        
+        # Stroke management for better drawing
+        self.stroke_manager = StrokeManager()
+        
+        # Hand visibility tracking
+        self.hand_visible = False
+        self.hand_lost_time = 0
+        self.hand_visibility_threshold = 0.3  # seconds
+
+        # Double click tracking
+        self.double_click_active = False
+        self.double_click_start_time = 0
+        self.double_click_duration = 0.5  # Time window for double click gesture to be recognized
 
     def get_finger_states(self, hand_landmarks):
         """Get the state of each finger (up/down) with improved accuracy"""
@@ -142,6 +268,8 @@ class GestureController:
         # Get specific landmark positions
         thumb_tip = hand_landmarks.landmark[self.mp_hands.HandLandmark.THUMB_TIP]
         index_tip = hand_landmarks.landmark[self.mp_hands.HandLandmark.INDEX_FINGER_TIP]
+        middle_tip = hand_landmarks.landmark[self.mp_hands.HandLandmark.MIDDLE_FINGER_TIP]
+        ring_tip = hand_landmarks.landmark[self.mp_hands.HandLandmark.RING_FINGER_TIP]
         
         # Calculate thumb-index distance for pinch detection
         thumb_index_dist = math.sqrt(
@@ -151,117 +279,200 @@ class GestureController:
         )
 
         # Define gestures with improved accuracy
-        is_toggle = (not any(fingers_extended[:4]) and 
-                    fingers_extended[4] and  # Only pinky raised
-                    thumb_index_dist > 0.1)  # Ensure no pinch
-
+        is_whiteboard_toggle = (not any(fingers_extended[:4]) and 
+                              fingers_extended[4] and  # Only pinky raised
+                              thumb_index_dist > 0.1)  # Ensure no pinch
+                              
+        # Mouse toggle gesture - pinky AND ring finger up, others down
+        is_mouse_toggle = (not fingers_extended[0] and  # Thumb down
+                          not fingers_extended[1] and  # Index down
+                          not fingers_extended[2] and  # Middle down
+                          fingers_extended[3] and      # Ring up
+                          fingers_extended[4])         # Pinky up
+        # Double click gesture - thumb, index, and pinky up, others down
+        is_double_click = (fingers_extended[0] and     # Thumb up
+                        fingers_extended[1] and     # Index up
+                        not fingers_extended[2] and  # Middle down
+                        not fingers_extended[3] and  # Ring down
+                        fingers_extended[4])         # Pinky up
         gestures = {
             'pinch': thumb_index_dist < 0.05,
             'eraser': fingers_extended[1] and fingers_extended[2] and not any(fingers_extended[3:]),
             'copy': fingers_extended[1] and fingers_extended[2] and fingers_extended[3] and not fingers_extended[4],
             'paste': all(fingers_extended[1:]),
-            'toggle': is_toggle
+            'toggle_whiteboard': is_whiteboard_toggle,
+            'toggle_mouse': is_mouse_toggle,
+            'double_click': is_double_click 
         }
         
         return gestures
 
-    def handle_toggle_gesture(self, gestures):
-        """Improved toggle gesture handling with proper timing"""
+    def handle_toggle_gestures(self, gestures):
+        """Handle toggle gestures with proper timing"""
         current_time = time.time()
         
-        if gestures['toggle']:
-            if self.toggle_gesture_start is None:
-                self.toggle_gesture_start = current_time
-            elif (current_time - self.toggle_gesture_start) >= self.toggle_hold_duration:
+        # Handle whiteboard toggle
+        if gestures['toggle_whiteboard']:
+            if self.toggle_wb_gesture_start is None:
+                self.toggle_wb_gesture_start = current_time
+            elif (current_time - self.toggle_wb_gesture_start) >= self.toggle_hold_duration:
                 if (current_time - self.last_gesture_time) > self.gesture_cooldown:
                     self.whiteboard_active = not self.whiteboard_active
                     self.last_gesture_time = current_time
-                    self.toggle_gesture_start = None
+                    self.toggle_wb_gesture_start = None
                     print(f"Whiteboard {'activated' if self.whiteboard_active else 'deactivated'}!")
         else:
-            self.toggle_gesture_start = None
+            self.toggle_wb_gesture_start = None
+            
+        # Handle mouse toggle
+        if gestures['toggle_mouse']:
+            if self.toggle_mouse_gesture_start is None:
+                self.toggle_mouse_gesture_start = current_time
+            elif (current_time - self.toggle_mouse_gesture_start) >= self.toggle_hold_duration:
+                if (current_time - self.last_gesture_time) > self.gesture_cooldown:
+                    self.mouse_control_active = not self.mouse_control_active
+                    self.last_gesture_time = current_time
+                    self.toggle_mouse_gesture_start = None
+                    print(f"Mouse control {'activated' if self.mouse_control_active else 'deactivated'}!")
+        else:
+            self.toggle_mouse_gesture_start = None
 
-    def handle_mouse_and_drawing(self, hand_landmarks, frame_width, frame_height):
-        """Enhanced handler for mouse, drawing, and gestures with improved cursor handling"""
+    def handle_mouse_and_drawing(self, hand_landmarks, frame_width, frame_height, frame):
+        """Enhanced handler for mouse, drawing, and gestures with Kalman filtering"""
         # Get index finger tip position
         index_tip = hand_landmarks.landmark[self.mp_hands.HandLandmark.INDEX_FINGER_TIP]
         
-        # Convert to screen coordinates
+        # Convert to pixel coordinates
         x = int(index_tip.x * frame_width)
         y = int(index_tip.y * frame_height)
         
-        # Apply mouse smoothing
-        smooth_x, smooth_y = self.smooth_mouse_movement(x, y)
+        # Track that hand is visible
+        self.hand_visible = True
         
-        # Convert to screen coordinates
-        screen_x = int((smooth_x / frame_width) * self.screen_width)
-        screen_y = int((smooth_y / frame_height) * self.screen_height)
+        # Apply Kalman filter for smooth tracking
+        filtered_x, filtered_y = self.position_kalman.filter(x, y)
         
-        # Ensure coordinates are within screen bounds
-        screen_x = max(0, min(screen_x, self.screen_width - 1))
-        screen_y = max(0, min(screen_y, self.screen_height - 1))
+        # Check if inside virtual monitor
+        self.in_virtual_monitor = (self.virtual_monitor_x < filtered_x < (self.virtual_monitor_x + self.virtual_monitor_width) and 
+                                  self.virtual_monitor_y < filtered_y < (self.virtual_monitor_y + self.virtual_monitor_height))
         
-        # Move mouse cursor
-        win32api.SetCursorPos((screen_x, screen_y))
+        # Convert to screen coordinates if in virtual monitor
+        screen_x, screen_y = filtered_x, filtered_y
+        if self.in_virtual_monitor:
+            # Map virtual monitor to full screen
+            screen_x = int((filtered_x - self.virtual_monitor_x) / self.virtual_monitor_width * self.screen_width)
+            screen_y = int((filtered_y - self.virtual_monitor_y) / self.virtual_monitor_height * self.screen_height)
+            
+            # Ensure coordinates are within screen bounds
+            screen_x = max(0, min(screen_x, self.screen_width - 1))
+            screen_y = max(0, min(screen_y, self.screen_height - 1))
+            
+            # Move mouse cursor only if mouse control is active AND pointer is inside virtual monitor
+            if self.mouse_control_active:
+                win32api.SetCursorPos((screen_x, screen_y))
         
-        # Detect gestures and handle toggle
+        # Detect gestures and handle toggles
         gestures = self.detect_gestures(hand_landmarks)
-        self.handle_toggle_gesture(gestures)
-        self.handle_scroll(hand_landmarks)
+        self.handle_toggle_gestures(gestures)
+        
+        # Handle scroll if mouse control is active AND in virtual monitor
+        if self.mouse_control_active and self.in_virtual_monitor:
+            self.handle_scroll(hand_landmarks)
+        
         current_time = time.time()
         
         # Handle copy/paste gestures
-        if current_time - self.last_gesture_time > self.gesture_cooldown:
+        if self.mouse_control_active and self.in_virtual_monitor and current_time - self.last_gesture_time > self.gesture_cooldown:
             if gestures['copy']:
                 pyautogui.hotkey('ctrl', 'c')
+                print("Copied")
                 self.last_gesture_time = current_time
-                print("Copy gesture detected!")
             elif gestures['paste']:
                 pyautogui.hotkey('ctrl', 'v')
+                print("Pasted")
                 self.last_gesture_time = current_time
-                print("Paste gesture detected!")
+
+        # Handle double click gesture
+        if gestures['double_click']:
+            if not self.double_click_active:
+                self.double_click_active = True
+                self.double_click_start_time = current_time
+                print("Double click gesture detected")
+            elif current_time - self.double_click_start_time < self.double_click_duration:
+                # Perform double click
+                win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, screen_x, screen_y, 0, 0)
+                win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, screen_x, screen_y, 0, 0)
+                win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, screen_x, screen_y, 0, 0)
+                win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, screen_x, screen_y, 0, 0)
+                print("Double click performed")
+                self.last_gesture_time = current_time
+                self.double_click_active = False
+        else:
+            # Reset double click state if the gesture is no longer held
+            self.double_click_active = False
         
-        # Handle mouse click and drawing
-        if gestures['pinch'] and not self.mouse_pressed and (current_time - self.last_click_time) > self.click_cooldown:
-            win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, screen_x, screen_y, 0, 0)
-            self.mouse_pressed = True
-            self.last_click_time = current_time
+        # Handle drawing and mouse states
+        if self.mouse_control_active and self.in_virtual_monitor:
+            # Pinch gesture handling
+            if gestures['pinch'] and not self.mouse_pressed and (current_time - self.last_click_time) > self.click_cooldown:
+                # Mouse down action
+                win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, screen_x, screen_y, 0, 0)
+                self.mouse_pressed = True
+                self.last_click_time = current_time
+                
+                # Start drawing if whiteboard is active
+                if self.whiteboard_active:
+                    self.drawing = True
+                    # Use the drawing-specific Kalman filter for enhanced precision
+                    draw_x, draw_y = self.drawing_kalman.filter(filtered_x, filtered_y)
+                    self.stroke_manager.start_stroke((draw_x, draw_y))
+                
+            # Release pinch gesture handling
+            elif not gestures['pinch'] and self.mouse_pressed:
+                # Mouse up action
+                win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, screen_x, screen_y, 0, 0)
+                self.mouse_pressed = False
+                
+                # End drawing if active
+                if self.drawing:
+                    self.drawing = False
+                    self.stroke_manager.end_stroke()
             
-            if self.whiteboard_active:
-                self.drawing = True
-                self.drawing_points.append((x, y))
-            
-        elif not gestures['pinch'] and self.mouse_pressed:
-            win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, screen_x, screen_y, 0, 0)
-            self.mouse_pressed = False
-            self.drawing = False
+            # Continue drawing if in drawing mode
+            elif self.drawing and gestures['pinch']:
+                # Use the drawing-specific Kalman filter for drawing movement
+                draw_x, draw_y = self.drawing_kalman.filter(filtered_x, filtered_y)
+                self.stroke_manager.add_point((draw_x, draw_y))
         
-        # Handle drawing if whiteboard is active
+        # Handle whiteboard drawing and visualization
         if self.whiteboard_active:
-            # Only draw when in drawing mode (pinch gesture)
+            # Draw current stroke if in drawing mode
             if self.drawing:
-                self.drawing_points.append((x, y))
-                if len(self.drawing_points) >= 2:
-                    smoothed_points = self.smooth_drawing(list(self.drawing_points))
-                    for i in range(len(smoothed_points) - 1):
+                current_stroke = self.stroke_manager.get_current_stroke()
+                if len(current_stroke) >= 2:
+                    for i in range(len(current_stroke) - 1):
                         cv2.line(self.whiteboard, 
-                                smoothed_points[i], 
-                                smoothed_points[i + 1], 
+                                current_stroke[i], 
+                                current_stroke[i + 1], 
                                 self.draw_color, 
                                 self.draw_thickness, 
                                 cv2.LINE_AA)
-                    self.drawing_points.clear()
-                    self.drawing_points.append((x, y))
             
+            # Handle eraser
             if gestures['eraser']:
-                cv2.circle(self.whiteboard, (x, y), self.eraser_size, self.eraser_color, -1)
+                cv2.circle(self.whiteboard, (filtered_x, filtered_y), self.eraser_size, self.eraser_color, -1)
         
-        return x, y
+        
+        # Store last position
+        self.last_actual_pos = (x, y)
+        
+        # Return filtered coordinates for visualization
+        return filtered_x, filtered_y
     
     def handle_scroll(self, hand_landmarks):
-        """Simple and reliable scroll handler"""
+        """Enhanced scroll handler with improved reliability"""
         fingers_extended = self.get_finger_states(hand_landmarks)
-        is_scroll_gesture = (fingers_extended[1] and 
+        is_scroll_gesture = (fingers_extended[1] and f
                            fingers_extended[2] and 
                            not any(fingers_extended[3:]) and 
                            not fingers_extended[0])
@@ -273,43 +484,81 @@ class GestureController:
             if not self.scroll_active:
                 self.scroll_active = True
                 self.last_scroll_y = current_y
+                self.scroll_gesture_start_y = current_y
+                self.scroll_velocity = 0
             else:
                 if self.last_scroll_y is not None:
+                    # Calculate raw y difference
                     y_diff = current_y - self.last_scroll_y
-                    if abs(y_diff) > 0.01:
-                        scroll_amount = int(y_diff * 1000)
-                        scroll_amount = max(min(scroll_amount, 50), -50)
+                    
+                    # Apply threshold to avoid unintentional small movements
+                    if abs(y_diff) > self.scroll_threshold:
+                        # Use Kalman filter to smooth scroll behavior
+                        self.scroll_velocity = self.scroll_velocity * 0.7 + y_diff * 0.3
+                        scroll_amount = int(self.scroll_velocity * 1000)
+                        scroll_amount = max(min(scroll_amount, 50), -50)  # Limit scroll amount
                         win32api.mouse_event(MOUSEEVENTF_WHEEL, 0, 0, -scroll_amount, 0)
+                        
                     self.last_scroll_y = current_y
         else:
+            # Reset scroll state when gesture ends
             self.scroll_active = False
             self.last_scroll_y = None
+            self.scroll_velocity = 0
 
-    def smooth_mouse_movement(self, x, y):
-        """Smooth mouse movement to reduce jitter"""
-        if self.last_mouse_pos == (0, 0):
-            self.last_mouse_pos = (x, y)
-            return x, y
-            
-        smoothed_x = int(x * self.mouse_smoothing_factor + self.last_mouse_pos[0] * (1 - self.mouse_smoothing_factor))
-        smoothed_y = int(y * self.mouse_smoothing_factor + self.last_mouse_pos[1] * (1 - self.mouse_smoothing_factor))
+    def update_virtual_monitor(self, frame):
+        """Update virtual monitor position based on face position"""
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        face_results = self.face_detection.process(rgb_frame)
         
-        self.last_mouse_pos = (smoothed_x, smoothed_y)
-        return smoothed_x, smoothed_y
+        if face_results.detections:
+            for detection in face_results.detections:
+                bboxC = detection.location_data.relative_bounding_box
+                h, w, _ = frame.shape
+                head_x = int(bboxC.xmin * w + bboxC.width * w / 2)
+                head_y = int(bboxC.ymin * h + bboxC.height * h / 2)
+                
+                # Apply Kalman filtering to face position for smoother transitions
+                # Only slightly adjust the monitor position each frame for smoother motion
+                target_x = max(0, head_x - self.virtual_monitor_width // 2)
+                target_y = max(0, head_y - self.virtual_monitor_height // 2)
+                
+                # Smooth transition
+                self.virtual_monitor_x = int(self.virtual_monitor_x * 0.9 + target_x * 0.1)
+                self.virtual_monitor_y = int(self.virtual_monitor_y * 0.9 + target_y * 0.1)
+                
+                # Ensure the virtual monitor stays within frame bounds
+                self.virtual_monitor_x = min(self.virtual_monitor_x, frame.shape[1] - self.virtual_monitor_width)
+                self.virtual_monitor_y = min(self.virtual_monitor_y, frame.shape[0] - self.virtual_monitor_height)
+                break  # Process only the first detected face
 
-    def smooth_drawing(self, points):
-        """Smooth drawing points for better line quality"""
-        if len(points) < 3:
-            return points
-            
-        smoothed = []
-        for i in range(1, len(points) - 1):
-            x = int(points[i-1][0] * 0.25 + points[i][0] * 0.5 + points[i+1][0] * 0.25)
-            y = int(points[i-1][1] * 0.25 + points[i][1] * 0.5 + points[i+1][1] * 0.25)
-            smoothed.append((x, y))
-            
-        return smoothed
-
+    def check_hand_visibility(self):
+        """Check if hand is visible and handle disappearance appropriately"""
+        current_time = time.time()
+        
+        if not self.hand_visible:
+            # Hand not visible in this frame
+            if self.drawing:
+                # If hand was lost while drawing, check if we should end the stroke
+                if self.hand_lost_time == 0:
+                    # Start timing when hand first disappears
+                    self.hand_lost_time = current_time
+                elif current_time - self.hand_lost_time > self.hand_visibility_threshold:
+                    # Hand has been gone for too long, end the stroke
+                    self.drawing = False
+                    self.stroke_manager.end_stroke()
+                    
+                    # Release mouse if needed
+                    if self.mouse_pressed:
+                        screen_x, screen_y = win32api.GetCursorPos()
+                        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, screen_x, screen_y, 0, 0)
+                        self.mouse_pressed = False
+        else:
+            # Hand is visible, reset the lost timer
+            self.hand_lost_time = 0
+        
+        # Reset hand visibility for next frame
+        self.hand_visible = False
 
     def process_frame(self):
         """Process each frame and update display with cursor overlay"""
@@ -320,6 +569,10 @@ class GestureController:
                 return False
 
             frame = cv2.flip(frame, 1)
+            
+            # Update virtual monitor position based on face position
+            self.update_virtual_monitor(frame)
+            
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = self.hands.process(rgb_frame)
 
@@ -329,17 +582,30 @@ class GestureController:
             else:
                 display = frame.copy()
 
+            # Check for hand visibility and handle hand tracking
+            cursor_pos = None
             if results.multi_hand_landmarks:
                 for hand_landmarks in results.multi_hand_landmarks:
                     self.mp_drawing.draw_landmarks(frame, hand_landmarks, self.mp_hands.HAND_CONNECTIONS)
-                    x, y = self.handle_mouse_and_drawing(hand_landmarks, frame.shape[1], frame.shape[0])
+                    cursor_x, cursor_y = self.handle_mouse_and_drawing(hand_landmarks, frame.shape[1], frame.shape[0], frame)
+                    cursor_pos = (cursor_x, cursor_y)
                     
-                    # Only draw the cursor (red dot) on the display copy, not the actual whiteboard
+                    # Only draw the cursor on the display copy, not the actual whiteboard
                     if self.whiteboard_active:
                         # Draw cursor with a more visible design
-                        cv2.circle(display, (x, y), 5, (0, 0, 255), -1)  # Inner red dot
-                        cv2.circle(display, (x, y), 6, (255, 255, 255), 1)  # White outline
-
+                        cv2.circle(display, (cursor_x, cursor_y), 5, (0, 0, 255), -1)  # Inner red dot
+                        cv2.circle(display, (cursor_x, cursor_y), 6, (255, 255, 255), 1)  # White outline
+            
+            # Check hand visibility status
+            self.check_hand_visibility()
+            
+            # Always draw virtual monitor rectangle
+            monitor_color = (0, 255, 0) if self.in_virtual_monitor else (255, 0, 0)
+            cv2.rectangle(frame, 
+                        (self.virtual_monitor_x, self.virtual_monitor_y), 
+                        (self.virtual_monitor_x + self.virtual_monitor_width, self.virtual_monitor_y + self.virtual_monitor_height), 
+                        monitor_color, 2)
+            
             # Calculate and display FPS
             current_time = time.time()
             fps = 1 / (current_time - self.prev_time)
@@ -347,18 +613,41 @@ class GestureController:
             self.fps_history.append(fps)
             avg_fps = sum(self.fps_history) / len(self.fps_history)
             
-            # Display toggle gesture progress
-            if self.toggle_gesture_start is not None:
-                progress = min((current_time - self.toggle_gesture_start) / self.toggle_hold_duration * 100, 100)
-                cv2.putText(frame, f'Toggle: {int(progress)}%', (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-
-            # Display FPS
-            cv2.putText(frame, f'FPS: {int(avg_fps)}', (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+            # Display stats
+            y_pos = 30  # Starting y position for text
+            cv2.putText(frame, f'FPS: {int(avg_fps)}', (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            y_pos += 30
+            
+            # Status indicators
+            cv2.putText(frame, f'Mouse: {"ON" if self.mouse_control_active else "OFF"}', (10, y_pos), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0) if self.mouse_control_active else (0, 0, 255), 2)
+            y_pos += 30
+            
+            cv2.putText(frame, f'Whiteboard: {"ON" if self.whiteboard_active else "OFF"}', (10, y_pos), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0) if self.whiteboard_active else (0, 0, 255), 2)
+            y_pos += 30
+            
+            cv2.putText(frame, f'Virtual Monitor: ON', (10, y_pos), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            y_pos += 30
+            
+            # Display whiteboard toggle progress if active
+            if self.toggle_wb_gesture_start is not None:
+                progress = min((current_time - self.toggle_wb_gesture_start) / self.toggle_hold_duration * 100, 100)
+                cv2.putText(frame, f'Whiteboard Toggle: {int(progress)}%', (10, y_pos), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                y_pos += 30
+                
+            # Display mouse toggle progress if active
+            if self.toggle_mouse_gesture_start is not None:
+                progress = min((current_time - self.toggle_mouse_gesture_start) / self.toggle_hold_duration * 100, 100)
+                cv2.putText(frame, f'Mouse Toggle: {int(progress)}%', (10, y_pos), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
             # Show/hide windows based on whiteboard state
             cv2.imshow("Hand Tracking", frame)
             if self.whiteboard_active:
-                cv2.imshow("Whiteboard", display)  # Show the display copy with cursor
+                cv2.imshow("Whiteboard", display)
                 cv2.namedWindow("Whiteboard", cv2.WINDOW_NORMAL)
                 cv2.moveWindow("Whiteboard", int(self.screen_width/4), int(self.screen_height/4))
                 cv2.resizeWindow("Whiteboard", self.whiteboard_width, self.whiteboard_height)
@@ -373,48 +662,109 @@ class GestureController:
                 self.running = False
             elif key == ord('c'):
                 self.whiteboard = np.ones((self.whiteboard_height, self.whiteboard_width, 3), np.uint8) * 255
+                self.stroke_manager.clear_strokes()
+                print("Whiteboard cleared")
+            elif key == ord('b'):
+                self.draw_color = (0, 0, 0)  # Black
+                print("Color set to black")
+            elif key == ord('r'):
+                self.draw_color = (0, 0, 255)  # Red
+                print("Color set to red")
+            elif key == ord('g'):
+                self.draw_color = (0, 255, 0)  # Green
+                print("Color set to green")
+            elif key == ord('b'):
+                self.draw_color = (255, 0, 0)  # Blue
+                print("Color set to blue")
+            elif key == ord('+') or key == ord('='):
+                self.draw_thickness = min(10, self.draw_thickness + 1)
+                print(f"Thickness increased to {self.draw_thickness}")
+            elif key == ord('-'):
+                self.draw_thickness = max(1, self.draw_thickness - 1)
+                print(f"Thickness decreased to {self.draw_thickness}")
+            elif key == ord('s'):
+                # Save whiteboard to file
+                timestamp = time.strftime("%Y%m%d-%H%M%S")
+                filename = f"whiteboard_{timestamp}.png"
+                cv2.imwrite(filename, self.whiteboard)
+                print(f"Saved whiteboard as {filename}")
             
             return True
-
         except Exception as e:
-            print(f"Error in process_frame: {e}")
-            return True
-        
+            print(f"Error processing frame: {str(e)}")
+            return False
+
     def run(self):
-        print("Starting Enhanced Gesture Controller")
-        print("\nGesture Controls:")
-        print("1. Basic Controls:")
-        print("   - Move mouse: Point with index finger")
-        print("   - Click/Draw: Pinch thumb and index finger")
-        print("   - Erase: Hold index and middle fingers together")
-        print("   - Scroll: Hold index and middle fingers up (others down)")
-        print("            Move hand up/down to scroll")
-        print("\n2. Advanced Controls:")
-        print("   - Copy: Raise index, middle, and ring fingers (keep pinky down)")
-        print("   - Paste: Raise all fingers")
-        print("   - Toggle Whiteboard: Raise ONLY pinky finger and hold for 1 second")
-        print("\n3. Keyboard Controls:")
-        print("   - Clear whiteboard: Press 'c'")
-        print("   - Quit program: Press 'q'")
-        print("\nNote: For toggle gesture, keep all fingers down except pinky and hold the position")
-        
+        """Main loop for the gesture controller"""
         self.running = True
         try:
             while self.running:
                 if not self.process_frame():
                     break
-        except KeyboardInterrupt:
-            print("\nGracefully shutting down...")
-        except Exception as e:
-            print(f"Unexpected error: {e}")
         finally:
-            self.cleanup()
-
-    def cleanup(self):
-        if self.cap is not None:
             self.cap.release()
-        cv2.destroyAllWindows()
+            cv2.destroyAllWindows()
+            print("Gesture controller stopped")
+
+    def improved_draw_strokes(self, frame):
+        """Improved drawing with stroke separation and smoothing"""
+        # Draw completed strokes
+        for stroke in self.stroke_manager.get_all_strokes():
+            if len(stroke) >= 2:
+                for i in range(len(stroke) - 1):
+                    cv2.line(frame, 
+                            stroke[i], 
+                            stroke[i + 1], 
+                            self.draw_color, 
+                            self.draw_thickness, 
+                            cv2.LINE_AA)
+        
+        # Draw current stroke
+        current_stroke = self.stroke_manager.get_current_stroke()
+        if len(current_stroke) >= 2:
+            for i in range(len(current_stroke) - 1):
+                cv2.line(frame, 
+                        current_stroke[i], 
+                        current_stroke[i + 1], 
+                        self.draw_color, 
+                        self.draw_thickness, 
+                        cv2.LINE_AA)
+                        
+        return frame
+
+
+class GestureControllerApp:
+    """Main application for the gesture controller"""
+    def __init__(self):
+        self.controller = GestureController()
+        
+    def start(self):
+        """Start the application"""
+        print("Starting gesture controller...")
+        print("\nKEYBOARD CONTROLS:")
+        print("q - Quit")
+        print("c - Clear whiteboard")
+        print("r - Set color to red")
+        print("g - Set color to green")
+        print("b - Set color to blue")
+        print("+ - Increase pen thickness")
+        print("- - Decrease pen thickness")
+        print("s - Save whiteboard to PNG file")
+        print("\nGESTURE CONTROLS:")
+        print("Pinch index finger and thumb - Mouse click / Draw")
+        print("Index + Middle finger up - Eraser")
+        print("Index + Middle + Ring up - Copy (Ctrl+C)")
+        print("All fingers up - Paste (Ctrl+V)")
+        print("Only Pinky up (hold) - Toggle whiteboard")
+        print("Ring + Pinky up (hold) - Toggle mouse control")
+        print("Index + Middle up, move up/down - Scroll")
+        print("\nVirtual Monitor:")
+        print("Green box when inside, Red when outside")
+        print("\nStarting camera...")
+        
+        self.controller.run()
+
 
 if __name__ == "__main__":
-    controller = GestureController()
-    controller.run()
+    app = GestureControllerApp()
+    app.start()
