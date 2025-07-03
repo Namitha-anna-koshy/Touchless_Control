@@ -1,16 +1,8 @@
-import cv2 
-import mediapipe as mp
-import numpy as np
-import time
-from collections import deque
-import pyautogui
-import win32api
-import win32con
-from win32con import MOUSEEVENTF_WHEEL
-import math
-import pyperclip
-import streamlit as st
-from gesture_controller import GestureControllerApp
-import json
-from streamlit_lottie import st_lottie
-import time
+opencv-python
+mediapipe
+numpy
+pyautogui
+pywin32
+pyperclip
+streamlit
+streamlit-lottie
