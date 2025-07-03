@@ -472,7 +472,7 @@ class GestureController:
     def handle_scroll(self, hand_landmarks):
         """Enhanced scroll handler with improved reliability"""
         fingers_extended = self.get_finger_states(hand_landmarks)
-        is_scroll_gesture = (fingers_extended[1] and f
+        is_scroll_gesture = (fingers_extended[1] and 
                            fingers_extended[2] and 
                            not any(fingers_extended[3:]) and 
                            not fingers_extended[0])
